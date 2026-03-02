@@ -1,0 +1,414 @@
+import { useEffect, useRef, useCallback } from 'react'
+import type { Map, GeoJSONSource } from 'maplibre-gl'
+import { useMapStore } from '../store/mapStore'
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const SOURCE_ID = 'traffic-vehicles-source'
+const LAYER_ID = 'traffic-vehicles-3d'
+const MIN_ZOOM = 13
+const MAX_VEHICLES = 500
+const UPDATE_MS = 50 // ~20 fps
+
+// ─── Vehicle specs ────────────────────────────────────────────────────────────
+
+interface VehicleSpec {
+  length: number
+  width: number
+  height: number
+  weight: number
+  colors: string[]
+}
+
+const SPECS: Record<string, VehicleSpec> = {
+  car: {
+    length: 4.2, width: 1.8, height: 1.5, weight: 0.70,
+    colors: ['#60a5fa', '#3b82f6', '#2563eb', '#1d4ed8'],
+  },
+  van: {
+    length: 5.5, width: 2.1, height: 2.3, weight: 0.15,
+    colors: ['#fbbf24', '#f59e0b', '#d97706', '#eab308'],
+  },
+  truck: {
+    length: 12, width: 2.5, height: 3.8, weight: 0.15,
+    colors: ['#f87171', '#ef4444', '#dc2626', '#b91c1c'],
+  },
+}
+
+// ─── Sim vehicle ──────────────────────────────────────────────────────────────
+
+interface SimVehicle {
+  id: number
+  coords: [number, number][]
+  segIdx: number
+  progress: number
+  speedMps: number
+  color: string
+  length: number
+  width: number
+  height: number
+  lateralOffset: number
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+let _nextId = 0
+
+function pick<T>(arr: T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)]
+}
+
+function weightedType(): string {
+  const r = Math.random()
+  let cum = 0
+  for (const [type, spec] of Object.entries(SPECS)) {
+    cum += spec.weight
+    if (r < cum) return type
+  }
+  return 'car'
+}
+
+const ROAD_SPEEDS: Record<string, [number, number]> = {
+  motorway: [90, 130], motorway_link: [60, 90],
+  trunk: [70, 110], trunk_link: [50, 70],
+  primary: [50, 80], primary_link: [40, 60],
+  secondary: [40, 60], secondary_link: [30, 50],
+  tertiary: [30, 50],
+  residential: [20, 40], living_street: [10, 20],
+  service: [10, 20], unclassified: [30, 50],
+}
+
+function randomSpeed(roadClass: string): number {
+  const [min, max] = ROAD_SPEEDS[roadClass] ?? [20, 50]
+  return (min + Math.random() * (max - min)) / 3.6
+}
+
+function segLenM(a: [number, number], b: [number, number]): number {
+  const dLat = b[1] - a[1]
+  const dLng = b[0] - a[0]
+  const cosLat = Math.cos(((a[1] + b[1]) / 2) * Math.PI / 180)
+  const dy = dLat * 111_320
+  const dx = dLng * cosLat * 111_320
+  return Math.sqrt(dx * dx + dy * dy)
+}
+
+function headingRad(a: [number, number], b: [number, number]): number {
+  return Math.atan2(b[0] - a[0], b[1] - a[1])
+}
+
+function vehicleRect(
+  center: [number, number],
+  h: number,
+  lengthM: number,
+  widthM: number,
+): [number, number][] {
+  const cosH = Math.cos(h)
+  const sinH = Math.sin(h)
+  const cosLat = Math.cos(center[1] * Math.PI / 180)
+  const halfL = lengthM / 2 / 111_320
+  const halfW = widthM / 2 / 111_320
+
+  // corners: front-right, front-left, back-left, back-right, close ring
+  const offsets: [number, number][] = [
+    [halfL, halfW], [halfL, -halfW],
+    [-halfL, -halfW], [-halfL, halfW],
+    [halfL, halfW],
+  ]
+
+  return offsets.map(([fwd, right]) => {
+    const dLat = fwd * cosH - right * sinH
+    const dLon = (fwd * sinH + right * cosH) / cosLat
+    return [center[0] + dLon, center[1] + dLat]
+  })
+}
+
+// ─── Road extraction ──────────────────────────────────────────────────────────
+
+interface RoadSeg {
+  coords: [number, number][]
+  roadClass: string
+}
+
+const SKIP_CLASSES = new Set(['path', 'track', 'ferry', 'rail', 'transit', 'raceway', 'busway', 'construction'])
+
+function extractRoadSegments(map: Map): RoadSeg[] {
+  const segments: RoadSeg[] = []
+
+  const processFeature = (f: { geometry: GeoJSON.Geometry; properties?: Record<string, unknown> }) => {
+    const cls = (f.properties?.class as string) || ''
+    if (SKIP_CLASSES.has(cls)) return
+    const geom = f.geometry
+    if (geom.type === 'LineString') {
+      const c = geom.coordinates as [number, number][]
+      if (c.length >= 2) segments.push({ coords: c, roadClass: cls })
+    } else if (geom.type === 'MultiLineString') {
+      for (const line of geom.coordinates as [number, number][][]) {
+        if (line.length >= 2) segments.push({ coords: line, roadClass: cls })
+      }
+    }
+  }
+
+  // Primary: query rendered features (works when road layers are visible)
+  for (const f of map.queryRenderedFeatures()) {
+    if (f.sourceLayer === 'transportation') processFeature(f)
+  }
+
+  if (segments.length > 0) return segments
+
+  // Fallback: query source features from any vector source
+  const style = map.getStyle()
+  if (!style?.sources) return segments
+
+  for (const srcId of Object.keys(style.sources)) {
+    const src = style.sources[srcId]
+    if (src.type !== 'vector') continue
+    try {
+      for (const f of map.querySourceFeatures(srcId, { sourceLayer: 'transportation' })) {
+        processFeature(f)
+      }
+      if (segments.length > 0) return segments
+    } catch { /* source may not have this layer */ }
+  }
+
+  return segments
+}
+
+// ─── Vehicle lifecycle ────────────────────────────────────────────────────────
+
+const SPAWN_PER_FRAME = 3 // max new vehicles per animation tick (prevents pop-in bursts)
+
+function spawnVehicle(segments: RoadSeg[], randomPosition: boolean): SimVehicle | null {
+  if (segments.length === 0) return null
+  const seg = pick(segments)
+  const type = weightedType()
+  const spec = SPECS[type]
+
+  const coords = Math.random() > 0.5 ? [...seg.coords] : [...seg.coords].reverse()
+
+  // randomPosition=true for initial population, false for replacements
+  // so new vehicles enter at the start of a road naturally
+  const startSeg = randomPosition
+    ? Math.floor(Math.random() * (coords.length - 1))
+    : 0
+
+  return {
+    id: _nextId++,
+    coords,
+    segIdx: startSeg,
+    progress: randomPosition ? Math.random() : 0,
+    speedMps: randomSpeed(seg.roadClass),
+    color: pick(spec.colors),
+    length: spec.length * (0.9 + Math.random() * 0.2),
+    width: spec.width * (0.9 + Math.random() * 0.15),
+    height: spec.height * (0.8 + Math.random() * 0.4),
+    lateralOffset: 1.5 + Math.random() * 1.5,
+  }
+}
+
+function stepVehicles(vehicles: SimVehicle[], dt: number): SimVehicle[] {
+  const alive: SimVehicle[] = []
+
+  for (const v of vehicles) {
+    const a = v.coords[v.segIdx]
+    const b = v.coords[v.segIdx + 1]
+    const len = segLenM(a, b)
+
+    if (len < 0.5) {
+      if (v.segIdx + 2 < v.coords.length) {
+        v.segIdx++
+        v.progress = 0
+        alive.push(v)
+      }
+      // Vehicle on degenerate final segment — silently drop it;
+      // the gradual top-up will replace it over coming frames.
+      continue
+    }
+
+    v.progress += (v.speedMps * dt) / len
+
+    if (v.progress >= 1) {
+      v.segIdx++
+      v.progress = 0
+      if (v.segIdx + 1 >= v.coords.length) {
+        // Reached end of road — let it die naturally.
+        // A replacement trickles in via the per-frame top-up.
+        continue
+      }
+    }
+
+    alive.push(v)
+  }
+
+  return alive
+}
+
+// ─── GeoJSON builder ──────────────────────────────────────────────────────────
+
+function buildGeoJSON(vehicles: SimVehicle[]): GeoJSON.FeatureCollection {
+  return {
+    type: 'FeatureCollection',
+    features: vehicles.map((v) => {
+      const a = v.coords[v.segIdx]
+      const b = v.coords[v.segIdx + 1]
+      const lng = a[0] + (b[0] - a[0]) * v.progress
+      const lat = a[1] + (b[1] - a[1]) * v.progress
+      const h = headingRad(a, b)
+
+      // Offset to the right of travel direction for lane positioning
+      const cosLat = Math.cos(lat * Math.PI / 180)
+      const offM = v.lateralOffset / 111_320
+      const adjLng = lng + (Math.cos(h) * offM) / cosLat
+      const adjLat = lat + (-Math.sin(h) * offM)
+
+      return {
+        type: 'Feature' as const,
+        geometry: {
+          type: 'Polygon' as const,
+          coordinates: [vehicleRect([adjLng, adjLat], h, v.length, v.width)],
+        },
+        properties: {
+          color: v.color,
+          height: v.height,
+        },
+      }
+    }),
+  }
+}
+
+// ─── Layer setup ──────────────────────────────────────────────────────────────
+
+function setupLayers(map: Map) {
+  if (map.getSource(SOURCE_ID)) return
+
+  map.addSource(SOURCE_ID, {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] },
+  })
+
+  map.addLayer({
+    id: LAYER_ID,
+    type: 'fill-extrusion',
+    source: SOURCE_ID,
+    minzoom: MIN_ZOOM,
+    paint: {
+      'fill-extrusion-color': ['get', 'color'],
+      'fill-extrusion-height': ['get', 'height'],
+      'fill-extrusion-base': 0,
+      'fill-extrusion-opacity': 0.92,
+    },
+    layout: { visibility: 'none' },
+  })
+}
+
+function setVisibility(map: Map, visible: boolean) {
+  if (map.getLayer(LAYER_ID)) {
+    map.setLayoutProperty(LAYER_ID, 'visibility', visible ? 'visible' : 'none')
+  }
+}
+
+// ─── Hook ─────────────────────────────────────────────────────────────────────
+
+export function useTrafficLayer(map: Map | null, mapReadySeq: number) {
+  const trafficEnabled = useMapStore((s) => s.layers.traffic)
+  const vehiclesRef = useRef<SimVehicle[]>([])
+  const segmentsRef = useRef<RoadSeg[]>([])
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const lastTRef = useRef(0)
+
+  const refreshRoads = useCallback(() => {
+    if (!map || map.getZoom() < MIN_ZOOM - 1) return
+    segmentsRef.current = extractRoadSegments(map)
+  }, [map])
+
+  const spawnAll = useCallback(() => {
+    const segs = segmentsRef.current
+    if (segs.length === 0) return
+    const count = Math.min(MAX_VEHICLES, Math.max(30, segs.length * 3))
+    const batch: SimVehicle[] = []
+    for (let i = 0; i < count; i++) {
+      const v = spawnVehicle(segs, true)
+      if (v) batch.push(v)
+    }
+    vehiclesRef.current = batch
+  }, [])
+
+  const startLoop = useCallback(() => {
+    if (timerRef.current || !map) return
+    lastTRef.current = performance.now()
+
+    timerRef.current = setInterval(() => {
+      const now = performance.now()
+      const dt = Math.min((now - lastTRef.current) / 1000, 0.25)
+      lastTRef.current = now
+
+      if (map.getZoom() < MIN_ZOOM) return
+
+      vehiclesRef.current = stepVehicles(vehiclesRef.current, dt)
+
+      // Gradually top up — only a few per frame to avoid pop-in bursts
+      const target = Math.min(MAX_VEHICLES, Math.max(30, segmentsRef.current.length * 3))
+      const deficit = target - vehiclesRef.current.length
+      const toSpawn = Math.min(deficit, SPAWN_PER_FRAME)
+      for (let i = 0; i < toSpawn; i++) {
+        const v = spawnVehicle(segmentsRef.current, false)
+        if (v) vehiclesRef.current.push(v)
+        else break
+      }
+
+      const src = map.getSource(SOURCE_ID) as GeoJSONSource | undefined
+      src?.setData(buildGeoJSON(vehiclesRef.current))
+    }, UPDATE_MS)
+  }, [map])
+
+  const stopLoop = useCallback(() => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current)
+      timerRef.current = null
+    }
+    vehiclesRef.current = []
+  }, [])
+
+  // ── Enable / disable ─────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!map || mapReadySeq === 0) return
+
+    setupLayers(map)
+    setVisibility(map, trafficEnabled)
+
+    if (trafficEnabled) {
+      refreshRoads()
+      spawnAll()
+      startLoop()
+    } else {
+      stopLoop()
+      const src = map.getSource(SOURCE_ID) as GeoJSONSource | undefined
+      src?.setData({ type: 'FeatureCollection', features: [] })
+    }
+
+    return () => { stopLoop() }
+  }, [trafficEnabled, map, mapReadySeq, refreshRoads, spawnAll, startLoop, stopLoop])
+
+  // ── Refresh roads on viewport change ──────────────────────────────────────
+  useEffect(() => {
+    if (!map || mapReadySeq === 0 || !trafficEnabled) return
+
+    let debounce: ReturnType<typeof setTimeout> | null = null
+
+    const handleMoveEnd = () => {
+      if (debounce) clearTimeout(debounce)
+      debounce = setTimeout(() => {
+        refreshRoads()
+        // Keep all existing vehicles — they continue on their stored
+        // coordinates.  The per-frame top-up will gradually fill any
+        // gap between current count and the target, so new vehicles
+        // trickle in naturally instead of the whole fleet teleporting.
+      }, 800)
+    }
+
+    map.on('moveend', handleMoveEnd)
+    return () => {
+      map.off('moveend', handleMoveEnd)
+      if (debounce) clearTimeout(debounce)
+    }
+  }, [map, mapReadySeq, trafficEnabled, refreshRoads])
+}
