@@ -1,6 +1,9 @@
 import { useEffect, useRef, useCallback, useState } from 'react'
 import maplibregl, { type Map, type StyleSpecification } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
+import MaplibreWorker from 'maplibre-gl/dist/maplibre-gl-csp-worker?worker'
+
+maplibregl.workerClass = MaplibreWorker
 import { useMapStore } from '../../store/mapStore'
 import {
   ROAD_STYLE_URL,
