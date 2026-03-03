@@ -434,16 +434,30 @@ function setupLayers(map: MaplibreMap) {
       },
       layout: { visibility: 'none' },
     })
-    console.log('[traffic] layers setup OK')
+
+    // Flat fallback layer in case fill-extrusion fails in this MapLibre build
+    map.addLayer({
+      id: LAYER_ID + '-flat',
+      type: 'fill',
+      source: SOURCE_ID,
+      minzoom: MIN_ZOOM,
+      paint: {
+        'fill-color': ['get', 'color'],
+        'fill-opacity': 0.85,
+      },
+      layout: { visibility: 'none' },
+    })
+
+    console.log('[traffic] layers setup OK (extrusion + flat fallback)')
   } catch (e) {
     console.error('[traffic] setupLayers FAILED:', e)
   }
 }
 
 function setVisibility(map: MaplibreMap, visible: boolean) {
-  if (map.getLayer(LAYER_ID)) {
-    map.setLayoutProperty(LAYER_ID, 'visibility', visible ? 'visible' : 'none')
-  }
+  const v = visible ? 'visible' : 'none'
+  if (map.getLayer(LAYER_ID)) map.setLayoutProperty(LAYER_ID, 'visibility', v)
+  if (map.getLayer(LAYER_ID + '-flat')) map.setLayoutProperty(LAYER_ID + '-flat', 'visibility', v)
 }
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
@@ -511,11 +525,10 @@ export function useTrafficLayer(map: MaplibreMap | null, mapReadySeq: number) {
       const geojson = buildGeoJSON(vehiclesRef.current)
 
       if (_tickCount <= 3 || _tickCount % 40 === 0) {
-        console.log(`[traffic] tick ${_tickCount}: ${vehiclesRef.current.length} vehicles, ${geojson.features.length} features, zoom=${map.getZoom().toFixed(1)}, source=${!!map.getSource(SOURCE_ID)}, layer=${!!map.getLayer(LAYER_ID)}`)
-        if (geojson.features.length > 0) {
-          const f = geojson.features[0]
-          console.log('[traffic] sample feature:', JSON.stringify(f).slice(0, 300))
-        }
+        const srcFeats = map.querySourceFeatures(SOURCE_ID).length
+        const vis3d = map.getLayer(LAYER_ID) ? map.getLayoutProperty(LAYER_ID, 'visibility') : 'MISSING'
+        const visFlat = map.getLayer(LAYER_ID + '-flat') ? map.getLayoutProperty(LAYER_ID + '-flat', 'visibility') : 'MISSING'
+        console.log(`[traffic] tick ${_tickCount}: ${vehiclesRef.current.length} vehicles → ${geojson.features.length} gjFeats, ${srcFeats} srcFeats, zoom=${map.getZoom().toFixed(1)}, vis3d=${vis3d}, visFlat=${visFlat}`)
       }
 
       const src = map.getSource(SOURCE_ID) as GeoJSONSource | undefined
