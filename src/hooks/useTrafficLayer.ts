@@ -9,6 +9,9 @@ const LAYER_ID = 'traffic-vehicles-3d'
 const MIN_ZOOM = 13
 const MAX_VEHICLES = 500
 const UPDATE_MS = 50 // ~20 fps
+const FADE_IN_S = 0.8
+const FADE_OUT_S = 0.8
+const CONNECT_RADIUS_M = 25
 
 // ─── Vehicle specs ────────────────────────────────────────────────────────────
 
@@ -48,6 +51,9 @@ interface SimVehicle {
   width: number
   height: number
   lateralOffset: number
+  age: number
+  fadingOut: boolean
+  fadeOutT: number
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -173,6 +179,75 @@ function extractRoadSegments(map: Map): RoadSeg[] {
   return segments
 }
 
+// ─── Road connectivity ───────────────────────────────────────────────────────
+
+interface EndpointEntry {
+  segIndex: number
+  end: 'start' | 'end'
+  coord: [number, number]
+}
+
+type EndpointIndex = Map<string, EndpointEntry[]>
+
+function epKey(coord: [number, number]): string {
+  return `${Math.round(coord[0] * 5000)},${Math.round(coord[1] * 5000)}`
+}
+
+function buildEndpointIndex(segments: RoadSeg[]): EndpointIndex {
+  const idx: EndpointIndex = new Map()
+  for (let i = 0; i < segments.length; i++) {
+    const c = segments[i].coords
+    for (const entry of [
+      { segIndex: i, end: 'start' as const, coord: c[0] },
+      { segIndex: i, end: 'end' as const, coord: c[c.length - 1] },
+    ]) {
+      const key = epKey(entry.coord)
+      let bucket = idx.get(key)
+      if (!bucket) { bucket = []; idx.set(key, bucket) }
+      bucket.push(entry)
+    }
+  }
+  return idx
+}
+
+function angleDiff(a: number, b: number): number {
+  let d = b - a
+  while (d > Math.PI) d -= 2 * Math.PI
+  while (d < -Math.PI) d += 2 * Math.PI
+  return Math.abs(d)
+}
+
+function findConnection(
+  coord: [number, number],
+  heading: number,
+  segments: RoadSeg[],
+  index: EndpointIndex,
+): { segIndex: number; reversed: boolean } | null {
+  const cx = Math.round(coord[0] * 5000)
+  const cy = Math.round(coord[1] * 5000)
+  const candidates: { segIndex: number; reversed: boolean }[] = []
+
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      const entries = index.get(`${cx + dx},${cy + dy}`)
+      if (!entries) continue
+      for (const e of entries) {
+        if (segLenM(coord, e.coord) > CONNECT_RADIUS_M) continue
+        const seg = segments[e.segIndex]
+        if (!seg) continue
+        const reversed = e.end === 'end'
+        const [s, n] = reversed
+          ? [seg.coords[seg.coords.length - 1], seg.coords[seg.coords.length - 2]]
+          : [seg.coords[0], seg.coords[1]]
+        if (angleDiff(heading, headingRad(s, n)) > 2.35) continue
+        candidates.push({ segIndex: e.segIndex, reversed })
+      }
+    }
+  }
+
+  return candidates.length > 0 ? pick(candidates) : null
+}
+
 // ─── Vehicle lifecycle ────────────────────────────────────────────────────────
 
 const SPAWN_PER_FRAME = 3 // max new vehicles per animation tick (prevents pop-in bursts)
@@ -202,13 +277,29 @@ function spawnVehicle(segments: RoadSeg[], randomPosition: boolean): SimVehicle 
     width: spec.width * (0.9 + Math.random() * 0.15),
     height: spec.height * (0.8 + Math.random() * 0.4),
     lateralOffset: 1.5 + Math.random() * 1.5,
+    age: randomPosition ? FADE_IN_S : 0,
+    fadingOut: false,
+    fadeOutT: 0,
   }
 }
 
-function stepVehicles(vehicles: SimVehicle[], dt: number): SimVehicle[] {
+function stepVehicles(
+  vehicles: SimVehicle[],
+  dt: number,
+  segments: RoadSeg[],
+  epIndex: EndpointIndex,
+): SimVehicle[] {
   const alive: SimVehicle[] = []
 
   for (const v of vehicles) {
+    v.age += dt
+
+    if (v.fadingOut) {
+      v.fadeOutT += dt
+      if (v.fadeOutT < FADE_OUT_S) alive.push(v)
+      continue
+    }
+
     const a = v.coords[v.segIdx]
     const b = v.coords[v.segIdx + 1]
     const len = segLenM(a, b)
@@ -218,9 +309,10 @@ function stepVehicles(vehicles: SimVehicle[], dt: number): SimVehicle[] {
         v.segIdx++
         v.progress = 0
         alive.push(v)
+      } else {
+        transferOrFade(v, segments, epIndex)
+        alive.push(v)
       }
-      // Vehicle on degenerate final segment — silently drop it;
-      // the gradual top-up will replace it over coming frames.
       continue
     }
 
@@ -230,8 +322,8 @@ function stepVehicles(vehicles: SimVehicle[], dt: number): SimVehicle[] {
       v.segIdx++
       v.progress = 0
       if (v.segIdx + 1 >= v.coords.length) {
-        // Reached end of road — let it die naturally.
-        // A replacement trickles in via the per-frame top-up.
+        transferOrFade(v, segments, epIndex)
+        alive.push(v)
         continue
       }
     }
@@ -240,6 +332,32 @@ function stepVehicles(vehicles: SimVehicle[], dt: number): SimVehicle[] {
   }
 
   return alive
+}
+
+function transferOrFade(
+  v: SimVehicle,
+  segments: RoadSeg[],
+  epIndex: EndpointIndex,
+) {
+  const endCoord = v.coords[v.coords.length - 1]
+  const prevCoord = v.coords[Math.max(0, v.coords.length - 2)]
+  const heading = segLenM(prevCoord, endCoord) > 0.5
+    ? headingRad(prevCoord, endCoord)
+    : 0
+  const conn = findConnection(endCoord, heading, segments, epIndex)
+
+  if (conn && segments[conn.segIndex]) {
+    const seg = segments[conn.segIndex]
+    v.coords = conn.reversed ? [...seg.coords].reverse() : [...seg.coords]
+    v.segIdx = 0
+    v.progress = 0
+    v.speedMps = randomSpeed(seg.roadClass)
+  } else {
+    v.segIdx = Math.max(0, v.coords.length - 2)
+    v.progress = 1
+    v.fadingOut = true
+    v.fadeOutT = 0
+  }
 }
 
 // ─── GeoJSON builder ──────────────────────────────────────────────────────────
@@ -254,11 +372,15 @@ function buildGeoJSON(vehicles: SimVehicle[]): GeoJSON.FeatureCollection {
       const lat = a[1] + (b[1] - a[1]) * v.progress
       const h = headingRad(a, b)
 
-      // Offset to the right of travel direction for lane positioning
       const cosLat = Math.cos(lat * Math.PI / 180)
       const offM = v.lateralOffset / 111_320
       const adjLng = lng + (Math.cos(h) * offM) / cosLat
       const adjLat = lat + (-Math.sin(h) * offM)
+
+      let hScale = 1
+      if (v.age < FADE_IN_S) hScale = v.age / FADE_IN_S
+      if (v.fadingOut) hScale = Math.max(0, 1 - v.fadeOutT / FADE_OUT_S)
+      hScale = hScale * (2 - hScale) // ease-out curve
 
       return {
         type: 'Feature' as const,
@@ -268,7 +390,7 @@ function buildGeoJSON(vehicles: SimVehicle[]): GeoJSON.FeatureCollection {
         },
         properties: {
           color: v.color,
-          height: v.height,
+          height: v.height * hScale,
         },
       }
     }),
@@ -312,12 +434,14 @@ export function useTrafficLayer(map: Map | null, mapReadySeq: number) {
   const trafficEnabled = useMapStore((s) => s.layers.traffic)
   const vehiclesRef = useRef<SimVehicle[]>([])
   const segmentsRef = useRef<RoadSeg[]>([])
+  const epIndexRef = useRef<EndpointIndex>(new Map())
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const lastTRef = useRef(0)
 
   const refreshRoads = useCallback(() => {
     if (!map || map.getZoom() < MIN_ZOOM - 1) return
     segmentsRef.current = extractRoadSegments(map)
+    epIndexRef.current = buildEndpointIndex(segmentsRef.current)
   }, [map])
 
   const spawnAll = useCallback(() => {
@@ -343,7 +467,7 @@ export function useTrafficLayer(map: Map | null, mapReadySeq: number) {
 
       if (map.getZoom() < MIN_ZOOM) return
 
-      vehiclesRef.current = stepVehicles(vehiclesRef.current, dt)
+      vehiclesRef.current = stepVehicles(vehiclesRef.current, dt, segmentsRef.current, epIndexRef.current)
 
       // Gradually top up — only a few per frame to avoid pop-in bursts
       const target = Math.min(MAX_VEHICLES, Math.max(30, segmentsRef.current.length * 3))
