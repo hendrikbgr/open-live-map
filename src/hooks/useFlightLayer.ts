@@ -122,7 +122,7 @@ function setupLayers(map: Map) {
     id: LAYER_AIRBORNE,
     type: 'symbol',
     source: SOURCE_ID,
-    filter: ['==', ['get', 'onGround'], false],
+    filter: ['!', ['get', 'onGround']],
     layout: {
       'icon-image': ICON_ID,
       'icon-size': [
@@ -155,8 +155,6 @@ function setupLayers(map: Map) {
         ['<', ['coalesce', ['get', 'verticalRate'], 0], -1], '#fb923c',  // descending — orange-400
         '#60a5fa',                                                         // level      — accent-glow
       ],
-      'icon-translate': [0, -40],
-      'icon-translate-anchor': 'viewport',
       'text-color': '#94a3b8',
       'text-halo-color': '#090e1a',
       'text-halo-width': 1.5,
@@ -168,7 +166,7 @@ function setupLayers(map: Map) {
     id: LAYER_GROUND,
     type: 'circle',
     source: SOURCE_ID,
-    filter: ['==', ['get', 'onGround'], true],
+    filter: ['!', ['!', ['get', 'onGround']]],
     layout: { visibility: 'none' },
     paint: {
       'circle-radius': [
