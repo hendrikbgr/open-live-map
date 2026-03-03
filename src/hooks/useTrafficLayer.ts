@@ -7,7 +7,7 @@ import { useMapStore } from '../store/mapStore'
 const SOURCE_ID = 'traffic-vehicles-source'
 const LAYER_ID = 'traffic-vehicles-3d'
 const MIN_ZOOM = 13
-const MAX_VEHICLES = 5000
+const MAX_VEHICLES = 2000
 const UPDATE_MS = 50 // ~20 fps
 const FADE_IN_S = 0.8
 const FADE_OUT_S = 0.8
@@ -19,23 +19,61 @@ interface VehicleSpec {
   length: number
   width: number
   height: number
-  weight: number
   colors: string[]
 }
 
 const SPECS: Record<string, VehicleSpec> = {
   car: {
-    length: 4.2, width: 1.8, height: 1.5, weight: 0.70,
+    length: 4.2, width: 1.8, height: 1.5,
     colors: ['#60a5fa', '#3b82f6', '#2563eb', '#1d4ed8'],
   },
   van: {
-    length: 5.5, width: 2.1, height: 2.3, weight: 0.15,
+    length: 5.5, width: 2.1, height: 2.3,
     colors: ['#fbbf24', '#f59e0b', '#d97706', '#eab308'],
   },
   truck: {
-    length: 12, width: 2.5, height: 3.8, weight: 0.15,
+    length: 12, width: 2.5, height: 3.8,
     colors: ['#f87171', '#ef4444', '#dc2626', '#b91c1c'],
   },
+}
+
+// ─── Road class profiles ─────────────────────────────────────────────────────
+// density: relative weight when picking which segment to spawn on (higher = more traffic)
+// mix: [car%, van%, truck%] — must sum to 1
+
+interface RoadProfile {
+  density: number
+  mix: [number, number, number]
+}
+
+const ROAD_PROFILES: Record<string, RoadProfile> = {
+  motorway:       { density: 8,   mix: [0.55, 0.15, 0.30] },
+  motorway_link:  { density: 5,   mix: [0.60, 0.15, 0.25] },
+  trunk:          { density: 6,   mix: [0.60, 0.15, 0.25] },
+  trunk_link:     { density: 4,   mix: [0.65, 0.15, 0.20] },
+  primary:        { density: 5,   mix: [0.65, 0.15, 0.20] },
+  primary_link:   { density: 3,   mix: [0.70, 0.15, 0.15] },
+  secondary:      { density: 3.5, mix: [0.75, 0.15, 0.10] },
+  secondary_link: { density: 2,   mix: [0.80, 0.12, 0.08] },
+  tertiary:       { density: 2,   mix: [0.80, 0.13, 0.07] },
+  residential:    { density: 1,   mix: [0.92, 0.06, 0.02] },
+  living_street:  { density: 0.4, mix: [0.96, 0.04, 0.00] },
+  service:        { density: 0.3, mix: [0.90, 0.08, 0.02] },
+  unclassified:   { density: 1,   mix: [0.85, 0.10, 0.05] },
+}
+
+const DEFAULT_PROFILE: RoadProfile = { density: 1, mix: [0.85, 0.10, 0.05] }
+
+function getRoadProfile(roadClass: string): RoadProfile {
+  return ROAD_PROFILES[roadClass] ?? DEFAULT_PROFILE
+}
+
+function weightedTypeForRoad(roadClass: string): string {
+  const [car, van] = getRoadProfile(roadClass).mix
+  const r = Math.random()
+  if (r < car) return 'car'
+  if (r < car + van) return 'van'
+  return 'truck'
 }
 
 // ─── Sim vehicle ──────────────────────────────────────────────────────────────
@@ -62,16 +100,6 @@ let _nextId = 0
 
 function pick<T>(arr: T[]): T {
   return arr[Math.floor(Math.random() * arr.length)]
-}
-
-function weightedType(): string {
-  const r = Math.random()
-  let cum = 0
-  for (const [type, spec] of Object.entries(SPECS)) {
-    cum += spec.weight
-    if (r < cum) return type
-  }
-  return 'car'
 }
 
 const ROAD_SPEEDS: Record<string, [number, number]> = {
@@ -133,6 +161,7 @@ function vehicleRect(
 interface RoadSeg {
   coords: [number, number][]
   roadClass: string
+  density: number
 }
 
 const SKIP_CLASSES = new Set(['path', 'track', 'ferry', 'rail', 'transit', 'raceway', 'busway', 'construction'])
@@ -144,12 +173,13 @@ function extractRoadSegments(map: MaplibreMap): RoadSeg[] {
     const cls = (f.properties?.class as string) || ''
     if (SKIP_CLASSES.has(cls)) return
     const geom = f.geometry
+    const d = getRoadProfile(cls).density
     if (geom.type === 'LineString') {
       const c = geom.coordinates as [number, number][]
-      if (c.length >= 2) segments.push({ coords: c, roadClass: cls })
+      if (c.length >= 2) segments.push({ coords: c, roadClass: cls, density: d })
     } else if (geom.type === 'MultiLineString') {
       for (const line of geom.coordinates as [number, number][][]) {
-        if (line.length >= 2) segments.push({ coords: line, roadClass: cls })
+        if (line.length >= 2) segments.push({ coords: line, roadClass: cls, density: d })
       }
     }
   }
@@ -250,18 +280,29 @@ function findConnection(
 
 // ─── Vehicle lifecycle ────────────────────────────────────────────────────────
 
-const SPAWN_PER_FRAME = 30
+const SPAWN_PER_FRAME = 12
 
-function spawnVehicle(segments: RoadSeg[], randomPosition: boolean): SimVehicle | null {
+function pickWeightedSegment(segments: RoadSeg[], totalDensity: number): RoadSeg {
+  let r = Math.random() * totalDensity
+  for (const seg of segments) {
+    r -= seg.density
+    if (r <= 0) return seg
+  }
+  return segments[segments.length - 1]
+}
+
+function spawnVehicle(
+  segments: RoadSeg[],
+  totalDensity: number,
+  randomPosition: boolean,
+): SimVehicle | null {
   if (segments.length === 0) return null
-  const seg = pick(segments)
-  const type = weightedType()
+  const seg = pickWeightedSegment(segments, totalDensity)
+  const type = weightedTypeForRoad(seg.roadClass)
   const spec = SPECS[type]
 
   const coords = Math.random() > 0.5 ? [...seg.coords] : [...seg.coords].reverse()
 
-  // randomPosition=true for initial population, false for replacements
-  // so new vehicles enter at the start of a road naturally
   const startSeg = randomPosition
     ? Math.floor(Math.random() * (coords.length - 1))
     : 0
@@ -447,19 +488,22 @@ export function useTrafficLayer(map: MaplibreMap | null, mapReadySeq: number) {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const lastTRef = useRef(0)
 
+  const totalDensityRef = useRef(0)
+
   const refreshRoads = useCallback(() => {
     if (!map || map.getZoom() < MIN_ZOOM - 1) return
     segmentsRef.current = extractRoadSegments(map)
     epIndexRef.current = buildEndpointIndex(segmentsRef.current)
+    totalDensityRef.current = segmentsRef.current.reduce((s, seg) => s + seg.density, 0)
   }, [map])
 
   const spawnAll = useCallback(() => {
     const segs = segmentsRef.current
     if (segs.length === 0) return
-    const count = Math.min(MAX_VEHICLES, Math.max(300, segs.length * 30))
+    const count = Math.min(MAX_VEHICLES, Math.max(120, Math.round(totalDensityRef.current * 4)))
     const batch: SimVehicle[] = []
     for (let i = 0; i < count; i++) {
-      const v = spawnVehicle(segs, true)
+      const v = spawnVehicle(segs, totalDensityRef.current, true)
       if (v) batch.push(v)
     }
     vehiclesRef.current = batch
@@ -478,11 +522,11 @@ export function useTrafficLayer(map: MaplibreMap | null, mapReadySeq: number) {
 
       vehiclesRef.current = stepVehicles(vehiclesRef.current, dt, segmentsRef.current, epIndexRef.current)
 
-      const target = Math.min(MAX_VEHICLES, Math.max(300, segmentsRef.current.length * 30))
+      const target = Math.min(MAX_VEHICLES, Math.max(120, Math.round(totalDensityRef.current * 4)))
       const deficit = target - vehiclesRef.current.length
       const toSpawn = Math.min(deficit, SPAWN_PER_FRAME)
       for (let i = 0; i < toSpawn; i++) {
-        const v = spawnVehicle(segmentsRef.current, false)
+        const v = spawnVehicle(segmentsRef.current, totalDensityRef.current, false)
         if (v) vehiclesRef.current.push(v)
         else break
       }
