@@ -1,0 +1,11 @@
+services:
+  app:
+    build:
+      context: .
+      args:
+        VITE_OPENSKY_CLIENT_ID: ${VITE_OPENSKY_CLIENT_ID:-}
+        VITE_OPENSKY_CLIENT_SECRET: ${VITE_OPENSKY_CLIENT_SECRET:-}
+        VITE_AISSTREAM_API_KEY: ${VITE_AISSTREAM_API_KEY:-}
+    ports:
+      - "8080:80"
+    restart: unless-stopped

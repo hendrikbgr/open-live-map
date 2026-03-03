@@ -142,6 +142,31 @@ npm run build
 npm run preview
 ```
 
+### Running with Docker
+
+Build and run the app as a container using Docker Compose:
+
+```bash
+cp .env.example .env        # fill in your API keys (optional)
+docker compose up -d
+```
+
+The app will be available at [http://localhost:8080](http://localhost:8080).
+
+Alternatively, build and run with plain Docker:
+
+```bash
+docker build \
+  --build-arg VITE_OPENSKY_CLIENT_ID=your_id \
+  --build-arg VITE_OPENSKY_CLIENT_SECRET=your_secret \
+  --build-arg VITE_AISSTREAM_API_KEY=your_key \
+  -t open-live-map .
+
+docker run -d -p 8080:80 open-live-map
+```
+
+> **Note:** API key build args are optional. The image uses a multi-stage build (Node for compilation, Nginx for serving) and includes reverse proxy rules for all external APIs and the AIS WebSocket relay.
+
 ---
 
 ## Project Structure
