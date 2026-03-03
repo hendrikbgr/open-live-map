@@ -300,6 +300,12 @@ function stepVehicles(
       continue
     }
 
+    if (v.segIdx + 1 >= v.coords.length) {
+      transferOrFade(v, segments, epIndex)
+      alive.push(v)
+      continue
+    }
+
     const a = v.coords[v.segIdx]
     const b = v.coords[v.segIdx + 1]
     const len = segLenM(a, b)
@@ -363,38 +369,42 @@ function transferOrFade(
 // ─── GeoJSON builder ──────────────────────────────────────────────────────────
 
 function buildGeoJSON(vehicles: SimVehicle[]): GeoJSON.FeatureCollection {
-  return {
-    type: 'FeatureCollection',
-    features: vehicles.map((v) => {
-      const a = v.coords[v.segIdx]
-      const b = v.coords[v.segIdx + 1]
-      const lng = a[0] + (b[0] - a[0]) * v.progress
-      const lat = a[1] + (b[1] - a[1]) * v.progress
-      const h = headingRad(a, b)
+  const features: GeoJSON.Feature[] = []
 
-      const cosLat = Math.cos(lat * Math.PI / 180)
-      const offM = v.lateralOffset / 111_320
-      const adjLng = lng + (Math.cos(h) * offM) / cosLat
-      const adjLat = lat + (-Math.sin(h) * offM)
+  for (const v of vehicles) {
+    const a = v.coords[v.segIdx]
+    const b = v.coords[v.segIdx + 1]
+    if (!a || !b) continue
 
-      let hScale = 1
-      if (v.age < FADE_IN_S) hScale = v.age / FADE_IN_S
-      if (v.fadingOut) hScale = Math.max(0, 1 - v.fadeOutT / FADE_OUT_S)
-      hScale = hScale * (2 - hScale) // ease-out curve
+    let hScale = 1
+    if (v.age < FADE_IN_S) hScale = v.age / FADE_IN_S
+    if (v.fadingOut) hScale = Math.max(0, 1 - v.fadeOutT / FADE_OUT_S)
+    hScale = hScale * (2 - hScale) // ease-out curve
+    if (hScale < 0.01) continue // skip invisible vehicles
 
-      return {
-        type: 'Feature' as const,
-        geometry: {
-          type: 'Polygon' as const,
-          coordinates: [vehicleRect([adjLng, adjLat], h, v.length, v.width)],
-        },
-        properties: {
-          color: v.color,
-          height: v.height * hScale,
-        },
-      }
-    }),
+    const lng = a[0] + (b[0] - a[0]) * v.progress
+    const lat = a[1] + (b[1] - a[1]) * v.progress
+    const h = headingRad(a, b)
+
+    const cosLat = Math.cos(lat * Math.PI / 180)
+    const offM = v.lateralOffset / 111_320
+    const adjLng = lng + (Math.cos(h) * offM) / cosLat
+    const adjLat = lat + (-Math.sin(h) * offM)
+
+    features.push({
+      type: 'Feature',
+      geometry: {
+        type: 'Polygon',
+        coordinates: [vehicleRect([adjLng, adjLat], h, v.length, v.width)],
+      },
+      properties: {
+        color: v.color,
+        height: v.height * hScale,
+      },
+    })
   }
+
+  return { type: 'FeatureCollection', features }
 }
 
 // ─── Layer setup ──────────────────────────────────────────────────────────────
@@ -480,7 +490,7 @@ export function useTrafficLayer(map: MaplibreMap | null, mapReadySeq: number) {
       }
 
       const src = map.getSource(SOURCE_ID) as GeoJSONSource | undefined
-      src?.setData(buildGeoJSON(vehiclesRef.current))
+      try { src?.setData(buildGeoJSON(vehiclesRef.current)) } catch { /* stale source */ }
     }, UPDATE_MS)
   }, [map])
 
