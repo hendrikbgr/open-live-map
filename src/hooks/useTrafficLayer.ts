@@ -410,26 +410,34 @@ function buildGeoJSON(vehicles: SimVehicle[]): GeoJSON.FeatureCollection {
 // ─── Layer setup ──────────────────────────────────────────────────────────────
 
 function setupLayers(map: MaplibreMap) {
-  if (map.getSource(SOURCE_ID)) return
+  if (map.getSource(SOURCE_ID)) {
+    console.log('[traffic] source already exists, skipping setup')
+    return
+  }
 
-  map.addSource(SOURCE_ID, {
-    type: 'geojson',
-    data: { type: 'FeatureCollection', features: [] },
-  })
+  try {
+    map.addSource(SOURCE_ID, {
+      type: 'geojson',
+      data: { type: 'FeatureCollection', features: [] },
+    })
 
-  map.addLayer({
-    id: LAYER_ID,
-    type: 'fill-extrusion',
-    source: SOURCE_ID,
-    minzoom: MIN_ZOOM,
-    paint: {
-      'fill-extrusion-color': ['get', 'color'],
-      'fill-extrusion-height': ['get', 'height'],
-      'fill-extrusion-base': 0,
-      'fill-extrusion-opacity': 0.92,
-    },
-    layout: { visibility: 'none' },
-  })
+    map.addLayer({
+      id: LAYER_ID,
+      type: 'fill-extrusion',
+      source: SOURCE_ID,
+      minzoom: MIN_ZOOM,
+      paint: {
+        'fill-extrusion-color': ['get', 'color'],
+        'fill-extrusion-height': ['get', 'height'],
+        'fill-extrusion-base': 0,
+        'fill-extrusion-opacity': 0.92,
+      },
+      layout: { visibility: 'none' },
+    })
+    console.log('[traffic] layers setup OK')
+  } catch (e) {
+    console.error('[traffic] setupLayers FAILED:', e)
+  }
 }
 
 function setVisibility(map: MaplibreMap, visible: boolean) {
@@ -449,14 +457,21 @@ export function useTrafficLayer(map: MaplibreMap | null, mapReadySeq: number) {
   const lastTRef = useRef(0)
 
   const refreshRoads = useCallback(() => {
-    if (!map || map.getZoom() < MIN_ZOOM - 1) return
+    if (!map || map.getZoom() < MIN_ZOOM - 1) {
+      console.log('[traffic] refreshRoads skipped — map:', !!map, 'zoom:', map?.getZoom())
+      return
+    }
     segmentsRef.current = extractRoadSegments(map)
     epIndexRef.current = buildEndpointIndex(segmentsRef.current)
+    console.log('[traffic] refreshRoads →', segmentsRef.current.length, 'segments,', epIndexRef.current.size, 'endpoint buckets')
   }, [map])
 
   const spawnAll = useCallback(() => {
     const segs = segmentsRef.current
-    if (segs.length === 0) return
+    if (segs.length === 0) {
+      console.warn('[traffic] spawnAll — no segments available')
+      return
+    }
     const count = Math.min(MAX_VEHICLES, Math.max(30, segs.length * 3))
     const batch: SimVehicle[] = []
     for (let i = 0; i < count; i++) {
@@ -464,22 +479,26 @@ export function useTrafficLayer(map: MaplibreMap | null, mapReadySeq: number) {
       if (v) batch.push(v)
     }
     vehiclesRef.current = batch
+    console.log('[traffic] spawnAll →', batch.length, 'vehicles')
   }, [])
 
   const startLoop = useCallback(() => {
     if (timerRef.current || !map) return
     lastTRef.current = performance.now()
+    let _tickCount = 0
+
+    console.log('[traffic] startLoop — beginning animation')
 
     timerRef.current = setInterval(() => {
       const now = performance.now()
       const dt = Math.min((now - lastTRef.current) / 1000, 0.25)
       lastTRef.current = now
+      _tickCount++
 
       if (map.getZoom() < MIN_ZOOM) return
 
       vehiclesRef.current = stepVehicles(vehiclesRef.current, dt, segmentsRef.current, epIndexRef.current)
 
-      // Gradually top up — only a few per frame to avoid pop-in bursts
       const target = Math.min(MAX_VEHICLES, Math.max(30, segmentsRef.current.length * 3))
       const deficit = target - vehiclesRef.current.length
       const toSpawn = Math.min(deficit, SPAWN_PER_FRAME)
@@ -489,8 +508,26 @@ export function useTrafficLayer(map: MaplibreMap | null, mapReadySeq: number) {
         else break
       }
 
+      const geojson = buildGeoJSON(vehiclesRef.current)
+
+      if (_tickCount <= 3 || _tickCount % 40 === 0) {
+        console.log(`[traffic] tick ${_tickCount}: ${vehiclesRef.current.length} vehicles, ${geojson.features.length} features, zoom=${map.getZoom().toFixed(1)}, source=${!!map.getSource(SOURCE_ID)}, layer=${!!map.getLayer(LAYER_ID)}`)
+        if (geojson.features.length > 0) {
+          const f = geojson.features[0]
+          console.log('[traffic] sample feature:', JSON.stringify(f).slice(0, 300))
+        }
+      }
+
       const src = map.getSource(SOURCE_ID) as GeoJSONSource | undefined
-      try { src?.setData(buildGeoJSON(vehiclesRef.current)) } catch { /* stale source */ }
+      if (!src) {
+        if (_tickCount <= 3) console.warn('[traffic] source not found on map!')
+        return
+      }
+      try {
+        src.setData(geojson)
+      } catch (e) {
+        console.error('[traffic] setData error:', e)
+      }
     }, UPDATE_MS)
   }, [map])
 
@@ -504,6 +541,7 @@ export function useTrafficLayer(map: MaplibreMap | null, mapReadySeq: number) {
 
   // ── Enable / disable ─────────────────────────────────────────────────────
   useEffect(() => {
+    console.log('[traffic] effect — enabled:', trafficEnabled, 'map:', !!map, 'mapReadySeq:', mapReadySeq)
     if (!map || mapReadySeq === 0) return
 
     setupLayers(map)
@@ -513,6 +551,10 @@ export function useTrafficLayer(map: MaplibreMap | null, mapReadySeq: number) {
       refreshRoads()
       spawnAll()
       startLoop()
+
+      map.on('error', (e: { error?: { message?: string } }) => {
+        console.error('[traffic] map error event:', e.error?.message ?? e)
+      })
     } else {
       stopLoop()
       const src = map.getSource(SOURCE_ID) as GeoJSONSource | undefined
