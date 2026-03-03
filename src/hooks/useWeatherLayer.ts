@@ -27,6 +27,7 @@ export function useWeatherLayer(map: Map | null, mapReadySeq: number) {
         type: 'raster',
         tiles: [frame.tileUrl],
         tileSize: 256,
+        maxzoom: 8,
         attribution: '&copy; RainViewer',
       })
 
