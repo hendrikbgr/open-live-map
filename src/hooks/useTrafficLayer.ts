@@ -7,7 +7,7 @@ import { useMapStore } from '../store/mapStore'
 const SOURCE_ID = 'traffic-vehicles-source'
 const LAYER_ID = 'traffic-vehicles-3d'
 const MIN_ZOOM = 13
-const MAX_VEHICLES = 500
+const MAX_VEHICLES = 5000
 const UPDATE_MS = 50 // ~20 fps
 const FADE_IN_S = 0.8
 const FADE_OUT_S = 0.8
@@ -250,7 +250,7 @@ function findConnection(
 
 // ─── Vehicle lifecycle ────────────────────────────────────────────────────────
 
-const SPAWN_PER_FRAME = 3 // max new vehicles per animation tick (prevents pop-in bursts)
+const SPAWN_PER_FRAME = 30
 
 function spawnVehicle(segments: RoadSeg[], randomPosition: boolean): SimVehicle | null {
   if (segments.length === 0) return null
@@ -456,7 +456,7 @@ export function useTrafficLayer(map: MaplibreMap | null, mapReadySeq: number) {
   const spawnAll = useCallback(() => {
     const segs = segmentsRef.current
     if (segs.length === 0) return
-    const count = Math.min(MAX_VEHICLES, Math.max(30, segs.length * 3))
+    const count = Math.min(MAX_VEHICLES, Math.max(300, segs.length * 30))
     const batch: SimVehicle[] = []
     for (let i = 0; i < count; i++) {
       const v = spawnVehicle(segs, true)
@@ -478,7 +478,7 @@ export function useTrafficLayer(map: MaplibreMap | null, mapReadySeq: number) {
 
       vehiclesRef.current = stepVehicles(vehiclesRef.current, dt, segmentsRef.current, epIndexRef.current)
 
-      const target = Math.min(MAX_VEHICLES, Math.max(30, segmentsRef.current.length * 3))
+      const target = Math.min(MAX_VEHICLES, Math.max(300, segmentsRef.current.length * 30))
       const deficit = target - vehiclesRef.current.length
       const toSpawn = Math.min(deficit, SPAWN_PER_FRAME)
       for (let i = 0; i < toSpawn; i++) {
