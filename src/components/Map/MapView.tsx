@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from 'react'
-import maplibregl, { Map, StyleSpecification } from 'maplibre-gl'
+import maplibregl, { type Map, type StyleSpecification } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { useMapStore } from '../../store/mapStore'
 import {
