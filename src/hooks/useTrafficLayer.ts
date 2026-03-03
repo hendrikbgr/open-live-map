@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback } from 'react'
-import type { Map, GeoJSONSource } from 'maplibre-gl'
+import type { Map as MaplibreMap, GeoJSONSource } from 'maplibre-gl'
 import { useMapStore } from '../store/mapStore'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -137,7 +137,7 @@ interface RoadSeg {
 
 const SKIP_CLASSES = new Set(['path', 'track', 'ferry', 'rail', 'transit', 'raceway', 'busway', 'construction'])
 
-function extractRoadSegments(map: Map): RoadSeg[] {
+function extractRoadSegments(map: MaplibreMap): RoadSeg[] {
   const segments: RoadSeg[] = []
 
   const processFeature = (f: { geometry: GeoJSON.Geometry; properties?: Record<string, unknown> }) => {
@@ -399,7 +399,7 @@ function buildGeoJSON(vehicles: SimVehicle[]): GeoJSON.FeatureCollection {
 
 // ─── Layer setup ──────────────────────────────────────────────────────────────
 
-function setupLayers(map: Map) {
+function setupLayers(map: MaplibreMap) {
   if (map.getSource(SOURCE_ID)) return
 
   map.addSource(SOURCE_ID, {
@@ -422,7 +422,7 @@ function setupLayers(map: Map) {
   })
 }
 
-function setVisibility(map: Map, visible: boolean) {
+function setVisibility(map: MaplibreMap, visible: boolean) {
   if (map.getLayer(LAYER_ID)) {
     map.setLayoutProperty(LAYER_ID, 'visibility', visible ? 'visible' : 'none')
   }
@@ -430,7 +430,7 @@ function setVisibility(map: Map, visible: boolean) {
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
-export function useTrafficLayer(map: Map | null, mapReadySeq: number) {
+export function useTrafficLayer(map: MaplibreMap | null, mapReadySeq: number) {
   const trafficEnabled = useMapStore((s) => s.layers.traffic)
   const vehiclesRef = useRef<SimVehicle[]>([])
   const segmentsRef = useRef<RoadSeg[]>([])
